@@ -163,69 +163,99 @@
         enabled: true
         state: started
 
+# -------------------------
+# Join Worker to Cluster
+# -------------------------
 
-    - name: Check if worker already joined
+    - name: Check if node already joined
       stat:
         path: /etc/kubernetes/kubelet.conf
       register: kubelet_conf
 
-    - name: Create kubeadm token on control plane if not exists
-      command: kubeadm token create
-      register: kubeadm_token_cmd
+    - name: Get existing kubeadm tokens
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        namespace: kube-system
+        kubeconfig: "{{ kubeconfig_path }}"
+      register: kubeadm_tokens
       delegate_to: "{{ groups['kube_control_plane'][0] }}"
       run_once: true
-      when: not kubelet_conf.stat.exists
 
-    - name: Get kubeadm token
-      set_fact:
-        kubeadm_token: "{{ kubeadm_token_cmd.stdout }}"
-      when: not kubelet_conf.stat.exists
-
-    - name: Get CA cert hash from control plane
-      shell: |
-        openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt \
-        | openssl rsa -pubin -outform der 2>/dev/null \
-        | openssl dgst -sha256 -hex \
-        | sed 's/^.* //'
-      register: ca_cert_hash_cmd
+    - name: Create kubeadm join token if none exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "bootstrap-token-{{ 999999 | random | regex_replace('^(..)(.*)$', '\\1') }}"
+            namespace: kube-system
+          type: bootstrap.kubernetes.io/token
+          stringData:
+            description: "Bootstrap token for kubeadm join"
+            token-id: "{{ lookup('password', '/dev/null length=6 chars=hex') }}"
+            token-secret: "{{ lookup('password', '/dev/null length=16 chars=hex') }}"
+            usage-bootstrap-authentication: "true"
+            usage-bootstrap-signing: "true"
+      when: kubeadm_tokens.resources | selectattr("metadata.name", "search", "^bootstrap-token") | list | length == 0
       delegate_to: "{{ groups['kube_control_plane'][0] }}"
       run_once: true
-      when: not kubelet_conf.stat.exists
+      register: new_token
 
-    - name: Set CA cert hash fact
+    - name: Set kubeadm join token fact
       set_fact:
-        ca_cert_hash: "{{ ca_cert_hash_cmd.stdout }}"
-      when: not kubelet_conf.stat.exists
+        kubeadm_token: >-
+          {{ (kubeadm_tokens.resources | selectattr("metadata.name", "search", "^bootstrap-token") | map(attribute="metadata.name") | list | first)
+             if (kubeadm_tokens.resources | selectattr("metadata.name", "search", "^bootstrap-token") | list | length > 0)
+             else new_token.result.metadata.name }}
+
+    - name: Get CA cert hash
+      slurp:
+        src: /etc/kubernetes/pki/ca.crt
+      register: ca_cert
+      delegate_to: "{{ groups['kube_control_plane'][0] }}"
+      run_once: true
+
+    - name: Calculate CA cert SHA256 hash
+      set_fact:
+        ca_cert_hash: "{{ ca_cert.content | b64decode | hash('sha256') }}"
 
     - name: Reset kubeadm if previous join failed
-      command: kubeadm reset -f
-      when: not kubelet_conf.stat.exists
+      ansible.builtin.raw: kubeadm reset -f
       ignore_errors: true
 
-    - name: Join worker node to cluster
-      command: >
-        kubeadm join {{ hostvars[groups['kube_control_plane'][0]].ansible_host }}:6443
-        --token {{ kubeadm_token }}
-        --discovery-token-ca-cert-hash sha256:{{ ca_cert_hash }}
-        --cri-socket {{ cri_socket }}
-      when: not kubelet_conf.stat.exists
+    - name: Remove old Kubernetes configs
+      ansible.builtin.file:
+        path: /etc/kubernetes/
+        state: absent
 
-    - name: Wait for node to become Ready
-      delegate_to: "{{ groups['kube_control_plane'][0] }}"
-      run_once: false
-      retries: 30
-      delay: 10
-      until: node_status.resources
-              | selectattr('metadata.name', 'equalto', inventory_hostname)
-              | map(attribute='status.conditions')
-              | map('selectattr', 'type', 'equalto', 'Ready')
-              | map('first')
-              | map(attribute='status')
-              | first == 'True'
+
+    - name: Join worker node to cluster
+      ansible.builtin.raw: |
+        kubeadm join {{ hostvars[groups['kube_control_plane'][0]].ansible_host }}:6443 \
+        --token {{ kubeadm_token | regex_replace('^bootstrap-token-', '') }} \
+        --discovery-token-ca-cert-hash sha256:{{ ca_cert_hash }} \
+        --cri-socket {{ cri_socket }}
+
+        #- name: Join worker node to cluster
+        #ansible.builtin.raw: |
+        #kubeadm join {{ groups['kube_control_plane'][0] }}:6443 \
+        #--token {{ kubeadm_token | regex_replace('^bootstrap-token-', '') }} \
+        #--discovery-token-ca-cert-hash sha256:{{ ca_cert_hash }} \
+        #--cri-socket {{ cri_socket }}
+        #when: not kubelet_conf.stat.exists
+
+    - name: Wait until node is Ready
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Node
         kubeconfig: "{{ kubeconfig_path }}"
       register: node_status
-      when: not kubelet_conf.stat.exists
-
+      until: >
+        (node_status.resources | selectattr("metadata.name", "equalto", inventory_hostname) | first).status.conditions |
+        selectattr("type", "equalto", "Ready") | map(attribute="status") | first == "True"
+      retries: 30
+      delay: 10
+      delegate_to: "{{ groups['kube_control_plane'][0] }}"
+        #when: not kubelet_conf.stat.exists

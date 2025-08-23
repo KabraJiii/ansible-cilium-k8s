@@ -12,5 +12,5 @@ galaxy_info:
     - name: EL
       versions: ["all"]
   galaxy_tags: [kubernetes, worker, node, setup]
-dependencies:
-  - role: kubernetes_setup
+    #dependencies:
+    #- role: kubernetes_setup
